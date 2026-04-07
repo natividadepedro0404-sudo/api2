@@ -1,3 +1,8 @@
+# IMPORTANTE: Monkey patch deve ser a PRIMEIRA coisa
+import eventlet
+eventlet.monkey_patch()
+
+# Agora sim, importar os outros módulos
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 import sqlite3
@@ -10,7 +15,9 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Configuração do SocketIO com eventlet
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Configuração dos webhooks
 WEBHOOKS = {
@@ -33,8 +40,7 @@ def init_db():
                   brainrot_name TEXT, 
                   brainrot_value INTEGER, 
                   brainrot_value_str TEXT, 
-                  timestamp DATETIME,
-                  position INTEGER DEFAULT 0)''')
+                  timestamp DATETIME)''')
     conn.commit()
     conn.close()
 
@@ -93,16 +99,11 @@ def webhook_filter():
                 "job_id": job_id,
                 "players": players,
                 "max_players": max_players,
-                "timestamp": datetime.now().isoformat(),
-                "position": 1  # Posição 1 = mais recente
+                "timestamp": datetime.now().isoformat()
             }
             
             # Inserir no início da lista
             latest_brainrots.insert(0, brainrot_with_meta)
-            
-            # Atualizar posições
-            for i, item in enumerate(latest_brainrots):
-                item['position'] = i + 1
             
             # Manter apenas os MAX_BRAINROTS mais recentes
             if len(latest_brainrots) > MAX_BRAINROTS:
@@ -114,7 +115,7 @@ def webhook_filter():
         # Mostrar status atual do cache
         print(f"\n📋 CACHE ATUAL ({len(latest_brainrots)}/{MAX_BRAINROTS} brainrots):")
         for i, brainrot in enumerate(latest_brainrots):
-            print(f"   {i+1}º - {brainrot.get('name')} - {brainrot.get('valueStr')} ({brainrot.get('timestamp')[:19]})")
+            print(f"   {i+1}º - {brainrot.get('name')} - {brainrot.get('valueStr')}")
         
         # Enviar via WebSocket para clientes conectados
         socketio.emit('new_brainrots', {
@@ -143,16 +144,13 @@ def get_brainrots():
     global latest_brainrots
     
     limit = request.args.get('limit', default=MAX_BRAINROTS, type=int)
-    limit = min(limit, MAX_BRAINROTS)  # Máximo é MAX_BRAINROTS
-    
-    # Retornar os brainrots mais recentes (já estão em ordem)
-    result_brainrots = latest_brainrots[:limit]
+    limit = min(limit, MAX_BRAINROTS)
     
     return jsonify({
         "status": "success",
-        "count": len(result_brainrots),
+        "count": len(latest_brainrots),
         "max": MAX_BRAINROTS,
-        "brainrots": result_brainrots,
+        "brainrots": latest_brainrots[:limit],
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -192,7 +190,7 @@ def health_check():
 
 @app.route('/clear-cache', methods=['POST'])
 def clear_cache():
-    """Endpoint para limpar o cache (admin apenas)"""
+    """Endpoint para limpar o cache"""
     global latest_brainrots
     latest_brainrots = []
     return jsonify({"status": "success", "message": "Cache cleared"}), 200
@@ -210,7 +208,7 @@ def home():
             "GET /get-servers": "Listar servidores",
             "GET /servers": "Alias para /get-servers",
             "GET /health": "Health check",
-            "POST /clear-cache": "Limpar cache (admin)"
+            "POST /clear-cache": "Limpar cache"
         }
     })
 
