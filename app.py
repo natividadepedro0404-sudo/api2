@@ -12,7 +12,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Configuração dos webhooks (SUBSTITUA PELOS SEUS)
+# Configuração dos webhooks
 WEBHOOKS = {
     "NORMAL_WEBHOOK": "https://discord.com/api/webhooks/1432382898123833477/tzktyvZAZ4T-y_CwEM6kqGCILxwZcEFVP9F8Gbepd1tAC8X6yjA0t1Lqurvs_P1d2RXX",
     "SPECIAL_WEBHOOK": "https://discord.com/api/webhooks/1432382898123833477/tzktyvZAZ4T-y_CwEM6kqGCILxwZcEFVP9F8Gbepd1tAC8X6yjA0t1Lqurvs_P1d2RXX",
@@ -20,7 +20,7 @@ WEBHOOKS = {
 }
 
 DB_FILE = "servers.db"
-CACHE_FILE = "latest_brainrots.json"
+MAX_BRAINROTS = 5  # Máximo de brainrots que serão mantidos
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -28,20 +28,20 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS sent_servers
                  (job_id TEXT PRIMARY KEY, timestamp DATETIME, players INTEGER, max_players INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS brainrot_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, brainrot_name TEXT, brainrot_value INTEGER, brainrot_value_str TEXT, timestamp DATETIME)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  job_id TEXT, 
+                  brainrot_name TEXT, 
+                  brainrot_value INTEGER, 
+                  brainrot_value_str TEXT, 
+                  timestamp DATETIME,
+                  position INTEGER DEFAULT 0)''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# Cache dos últimos brainrots encontrados
-latest_brainrots = {
-    "job_id": None,
-    "players": 0,
-    "max_players": 0,
-    "brainrots": [],
-    "timestamp": None
-}
+# Cache FIFO - apenas os 5 brainrots mais recentes
+latest_brainrots = []
 
 @app.route('/webhook-filter', methods=['POST'])
 def webhook_filter():
@@ -53,94 +53,107 @@ def webhook_filter():
             return jsonify({"status": "error", "message": "No data"}), 400
         
         job_id = data.get('job_id')
-        brainrots = data.get('brainrots', [])
+        new_brainrots = data.get('brainrots', [])
         players = data.get('players', 0)
         max_players = data.get('max_players', 0)
         
-        # Verificar duplicado
+        print(f"\n📥 Recebendo dados do servidor: {job_id}")
+        print(f"📊 Brainrots recebidos: {len(new_brainrots)}")
+        
+        # Verificar se o servidor já foi processado
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT job_id FROM sent_servers WHERE job_id = ?", (job_id,))
+        
         if not c.fetchone():
-            # Salvar no banco
+            # Salvar servidor no banco
             c.execute("INSERT INTO sent_servers VALUES (?, ?, ?, ?)", 
                       (job_id, datetime.now(), players, max_players))
-            
-            # Salvar histórico de brainrots
-            for brainrot in brainrots:
-                c.execute("INSERT INTO brainrot_history (job_id, brainrot_name, brainrot_value, brainrot_value_str, timestamp) VALUES (?, ?, ?, ?, ?)",
-                          (job_id, brainrot.get('name'), brainrot.get('value'), brainrot.get('valueStr'), datetime.now()))
-            
+            conn.commit()
+            print(f"✅ Servidor {job_id} salvo no banco")
+        
+        # Processar cada brainrot recebido
+        for brainrot in new_brainrots:
+            # Salvar no banco de dados
+            c.execute("""INSERT INTO brainrot_history 
+                        (job_id, brainrot_name, brainrot_value, brainrot_value_str, timestamp) 
+                        VALUES (?, ?, ?, ?, ?)""",
+                      (job_id, 
+                       brainrot.get('name'), 
+                       brainrot.get('value'), 
+                       brainrot.get('valueStr'), 
+                       datetime.now()))
             conn.commit()
             
-            # Atualizar cache
-            latest_brainrots = {
+            # Adicionar ao cache FIFO (no início da lista)
+            brainrot_with_meta = {
+                "name": brainrot.get('name'),
+                "value": brainrot.get('value'),
+                "valueStr": brainrot.get('valueStr'),
                 "job_id": job_id,
                 "players": players,
                 "max_players": max_players,
-                "brainrots": brainrots,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "position": 1  # Posição 1 = mais recente
             }
             
-            # Salvar cache em arquivo
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(latest_brainrots, f, default=str)
+            # Inserir no início da lista
+            latest_brainrots.insert(0, brainrot_with_meta)
+            
+            # Atualizar posições
+            for i, item in enumerate(latest_brainrots):
+                item['position'] = i + 1
+            
+            # Manter apenas os MAX_BRAINROTS mais recentes
+            if len(latest_brainrots) > MAX_BRAINROTS:
+                removed = latest_brainrots.pop()
+                print(f"🗑️ Removido brainrot antigo: {removed.get('name')}")
         
         conn.close()
         
-        # Enviar via WebSocket para clientes conectados
-        socketio.emit('new_brainrots', latest_brainrots)
+        # Mostrar status atual do cache
+        print(f"\n📋 CACHE ATUAL ({len(latest_brainrots)}/{MAX_BRAINROTS} brainrots):")
+        for i, brainrot in enumerate(latest_brainrots):
+            print(f"   {i+1}º - {brainrot.get('name')} - {brainrot.get('valueStr')} ({brainrot.get('timestamp')[:19]})")
         
-        # Enviar para Discord se tiver brainrots bons
-        if brainrots and brainrots[0].get('value', 0) >= 1000000:
+        # Enviar via WebSocket para clientes conectados
+        socketio.emit('new_brainrots', {
+            "brainrots": latest_brainrots,
+            "total": len(latest_brainrots),
+            "max": MAX_BRAINROTS,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Enviar para Discord se tiver brainrot bom
+        if new_brainrots and new_brainrots[0].get('value', 0) >= 1000000:
             send_to_discord(data)
         
-        return jsonify({"status": "sent", "message": "Data forwarded to clients"}), 200
+        return jsonify({
+            "status": "sent", 
+            "message": f"Data forwarded. Cache: {len(latest_brainrots)}/{MAX_BRAINROTS} brainrots"
+        }), 200
         
     except Exception as e:
-        print(f"Erro: {e}")
+        print(f"❌ Erro: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/get-brainrots', methods=['GET'])
 def get_brainrots():
-    """Endpoint GET para o menu buscar os brainrots"""
+    """Retorna os brainrots em ordem FIFO (mais recentes primeiro)"""
     global latest_brainrots
     
-    limit = request.args.get('limit', default=50, type=int)
-    min_value = request.args.get('min_value', default=0, type=int)
+    limit = request.args.get('limit', default=MAX_BRAINROTS, type=int)
+    limit = min(limit, MAX_BRAINROTS)  # Máximo é MAX_BRAINROTS
     
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    c.execute("""
-        SELECT bh.brainrot_name, bh.brainrot_value, bh.brainrot_value_str, bh.timestamp, s.players, s.max_players, bh.job_id
-        FROM brainrot_history bh
-        JOIN sent_servers s ON bh.job_id = s.job_id
-        WHERE bh.brainrot_value >= ?
-        ORDER BY bh.timestamp DESC
-        LIMIT ?
-    """, (min_value, limit))
-    
-    rows = c.fetchall()
-    conn.close()
-    
-    brainrots = []
-    for row in rows:
-        brainrots.append({
-            "name": row[0],
-            "value": row[1],
-            "valueStr": row[2],
-            "timestamp": row[3],
-            "players": row[4],
-            "max_players": row[5],
-            "job_id": row[6]
-        })
+    # Retornar os brainrots mais recentes (já estão em ordem)
+    result_brainrots = latest_brainrots[:limit]
     
     return jsonify({
         "status": "success",
-        "count": len(brainrots),
-        "brainrots": brainrots,
-        "latest": latest_brainrots
+        "count": len(result_brainrots),
+        "max": MAX_BRAINROTS,
+        "brainrots": result_brainrots,
+        "timestamp": datetime.now().isoformat()
     }), 200
 
 @app.route('/get-servers', methods=['GET'])
@@ -163,10 +176,9 @@ def get_servers():
     
     return jsonify({"status": "success", "servers": servers}), 200
 
-# ===== ENDPOINT /servers (para compatibilidade) =====
 @app.route('/servers', methods=['GET'])
 def servers():
-    """Alias para /get-servers (compatibilidade)"""
+    """Alias para /get-servers"""
     return get_servers()
 
 @app.route('/health', methods=['GET'])
@@ -174,22 +186,32 @@ def health_check():
     return jsonify({
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "endpoints": ["/webhook-filter", "/get-brainrots", "/get-servers", "/servers", "/health"]
+        "cache_size": len(latest_brainrots),
+        "max_brainrots": MAX_BRAINROTS
     }), 200
 
-@app.route('/', methods=['GET'])
+@app.route('/clear-cache', methods=['POST'])
+def clear_cache():
+    """Endpoint para limpar o cache (admin apenas)"""
+    global latest_brainrots
+    latest_brainrots = []
+    return jsonify({"status": "success", "message": "Cache cleared"}), 200
+
+@app.route('/')
 def home():
     return jsonify({
         "status": "online",
-        "service": "Brainrot Scanner API",
+        "service": "Brainrot Scanner API - FIFO Cache",
+        "max_brainrots": MAX_BRAINROTS,
+        "current_cache_size": len(latest_brainrots),
         "endpoints": {
             "POST /webhook-filter": "Recebe brainrots do Roblox",
-            "GET /get-brainrots": "Buscar brainrots para o menu",
+            "GET /get-brainrots": "Buscar brainrots (mais recentes primeiro)",
             "GET /get-servers": "Listar servidores",
             "GET /servers": "Alias para /get-servers",
-            "GET /health": "Health check"
-        },
-        "websocket": "ws://" + request.host + "/socket.io/"
+            "GET /health": "Health check",
+            "POST /clear-cache": "Limpar cache (admin)"
+        }
     })
 
 def send_to_discord(data):
@@ -200,7 +222,6 @@ def send_to_discord(data):
     
     highest = brainrots[0]
     
-    # Determinar categoria
     if highest.get('value', 0) >= 100000000:
         webhook = WEBHOOKS.get("ULTRA_HIGH_WEBHOOK")
         color = 0xFF6B6B
@@ -217,46 +238,49 @@ def send_to_discord(data):
     if not webhook:
         return
     
-    # Construir embed
     description = ""
     for i, b in enumerate(brainrots[:5], 1):
         description += f"**{i}º** - {b.get('name')}: **{b.get('valueStr')}**\n"
-    
-    # Adicionar informação do servidor
-    server_info = f"🎮 Servidor: `{data.get('job_id', 'Unknown')[:8]}...`\n👥 Jogadores: {data.get('players', 0)}/{data.get('max_players', 0)}"
     
     embed = {
         "title": f"{emoji} {highest.get('name')}",
         "description": description,
         "color": color,
         "fields": [
-            {"name": "📊 Informações", "value": server_info, "inline": False},
-            {"name": "🎯 Total Brainrots", "value": f"{len(brainrots)} encontrados", "inline": True}
+            {"name": "👥 Jogadores", "value": f"{data.get('players', 0)}/{data.get('max_players', 0)}", "inline": True},
+            {"name": "🎯 Total", "value": f"{len(brainrots)} brainrots", "inline": True}
         ],
-        "footer": {"text": "Brainrot Scanner"},
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
     
     try:
-        response = requests.post(webhook, json={"embeds": [embed]}, timeout=10)
-        if response.status_code >= 400:
-            print(f"Erro Discord: {response.status_code}")
+        requests.post(webhook, json={"embeds": [embed]}, timeout=10)
+        print(f"✅ Enviado para Discord: {highest.get('name')}")
     except Exception as e:
-        print(f"Erro ao enviar Discord: {e}")
+        print(f"❌ Erro ao enviar Discord: {e}")
 
 @socketio.on('connect')
 def handle_connect():
-    print(f"Cliente conectado: {request.sid}")
-    if latest_brainrots.get('brainrots'):
-        emit('new_brainrots', latest_brainrots)
+    print(f"🔌 Cliente conectado: {request.sid}")
+    emit('new_brainrots', {
+        "brainrots": latest_brainrots,
+        "total": len(latest_brainrots),
+        "max": MAX_BRAINROTS,
+        "timestamp": datetime.now().isoformat()
+    })
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print(f"Cliente desconectado: {request.sid}")
+    print(f"🔌 Cliente desconectado: {request.sid}")
 
 @socketio.on('get_latest')
 def handle_get_latest():
-    emit('new_brainrots', latest_brainrots)
+    emit('new_brainrots', {
+        "brainrots": latest_brainrots,
+        "total": len(latest_brainrots),
+        "max": MAX_BRAINROTS,
+        "timestamp": datetime.now().isoformat()
+    })
 
 def cleanup_old_entries():
     """Limpa entradas antigas do banco de dados"""
@@ -264,37 +288,26 @@ def cleanup_old_entries():
         try:
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            # Remove entradas com mais de 7 dias
             c.execute("DELETE FROM sent_servers WHERE timestamp < datetime('now', '-7 days')")
             c.execute("DELETE FROM brainrot_history WHERE timestamp < datetime('now', '-7 days')")
             deleted = conn.total_changes
             conn.commit()
             conn.close()
             if deleted > 0:
-                print(f"🧹 Banco de dados limpo: {deleted} entradas removidas")
+                print(f"🧹 Banco limpo: {deleted} entradas")
         except Exception as e:
-            print(f"Erro ao limpar banco: {e}")
-        
-        time.sleep(86400)  # Executa a cada 24 horas
+            print(f"Erro ao limpar: {e}")
+        time.sleep(86400)
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("🚀 BRAINROT SCANNER - API SERVER")
+    print("🚀 BRAINROT SCANNER - API SERVER (FIFO MODE)")
+    print("=" * 50)
+    print(f"📦 Máximo de brainrots no cache: {MAX_BRAINROTS}")
+    print("🔄 Modo FIFO: Os mais antigos saem quando novos chegam")
     print("=" * 50)
     
-    # Iniciar thread de limpeza
     cleanup_thread = threading.Thread(target=cleanup_old_entries, daemon=True)
     cleanup_thread.start()
-    
-    print("📡 WebSocket: ws://127.0.0.1:5000")
-    print("🌐 HTTP: http://127.0.0.1:5000")
-    print("\n📋 Endpoints disponíveis:")
-    print("   POST /webhook-filter - Receber brainrots do Roblox")
-    print("   GET  /get-brainrots  - Buscar brainrots (para o menu)")
-    print("   GET  /get-servers    - Listar servidores")
-    print("   GET  /servers        - Alias para /get-servers")
-    print("   GET  /health         - Health check")
-    print("   GET  /               - Informações da API")
-    print("=" * 50)
     
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
