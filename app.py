@@ -49,19 +49,34 @@ init_db()
 # Cache FIFO - apenas os 5 brainrots mais recentes
 latest_brainrots = []
 
-@app.route('/webhook-filter', methods=['POST'])
+@app.route('/webhook-filter', methods=['GET', 'POST'])
 def webhook_filter():
     global latest_brainrots
     
     try:
-        data = request.json
-        if not data:
-            return jsonify({"status": "error", "message": "No data"}), 400
+        # Aceitar dados de GET (query params) ou POST (body JSON)
+        if request.method == 'GET':
+            job_id = request.args.get('job_id')
+            players = request.args.get('players', 0, type=int)
+            max_players = request.args.get('max_players', 0, type=int)
+            brainrots_str = request.args.get('brainrots', '[]')
+            
+            try:
+                new_brainrots = json.loads(brainrots_str)
+            except:
+                new_brainrots = []
+        else:
+            data = request.json
+            if not data:
+                return jsonify({"status": "error", "message": "No data"}), 400
+            
+            job_id = data.get('job_id')
+            new_brainrots = data.get('brainrots', [])
+            players = data.get('players', 0)
+            max_players = data.get('max_players', 0)
         
-        job_id = data.get('job_id')
-        new_brainrots = data.get('brainrots', [])
-        players = data.get('players', 0)
-        max_players = data.get('max_players', 0)
+        if not job_id:
+            return jsonify({"status": "error", "message": "job_id is required"}), 400
         
         print(f"\n📥 Recebendo dados do servidor: {job_id}")
         print(f"📊 Brainrots recebidos: {len(new_brainrots)}")
@@ -127,7 +142,13 @@ def webhook_filter():
         
         # Enviar para Discord se tiver brainrot bom
         if new_brainrots and new_brainrots[0].get('value', 0) >= 1000000:
-            send_to_discord(data)
+            post_data = {
+                'job_id': job_id,
+                'brainrots': new_brainrots,
+                'players': players,
+                'max_players': max_players
+            }
+            send_to_discord(post_data)
         
         return jsonify({
             "status": "sent", 
@@ -203,7 +224,8 @@ def home():
         "max_brainrots": MAX_BRAINROTS,
         "current_cache_size": len(latest_brainrots),
         "endpoints": {
-            "POST /webhook-filter": "Recebe brainrots do Roblox",
+            "POST /webhook-filter": "Recebe brainrots do Roblox (POST)",
+            "GET /webhook-filter": "Recebe brainrots do Roblox (GET)",
             "GET /get-brainrots": "Buscar brainrots (mais recentes primeiro)",
             "GET /get-servers": "Listar servidores",
             "GET /servers": "Alias para /get-servers",
